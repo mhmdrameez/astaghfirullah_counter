@@ -436,6 +436,7 @@
   }
 
   tapBtn.addEventListener('click', function() {
+    unlockAudioContext();
     count += 1;
     totalAllTime += 1;
     if (navigator.vibrate) {
@@ -489,50 +490,136 @@
     }
   });
 
-  function playTickSound() {
+  function unlockAudioContext() {
     try {
       if (!audioCtx) {
         audioCtx = new (window.AudioContext || window.webkitAudioContext)();
       }
+      // iOS Safari workaround: play a silent buffer directly inside a user
+      // gesture to fully unlock the audio context for later programmatic use.
+      const buffer = audioCtx.createBuffer(1, 1, 22050);
+      const src = audioCtx.createBufferSource();
+      src.buffer = buffer;
+      src.connect(audioCtx.destination);
+      if (src.start) { src.start(0); } else if (src.noteOn) { src.noteOn(0); }
       if (audioCtx.state === 'suspended') {
         audioCtx.resume();
       }
-      const osc = audioCtx.createOscillator();
-      const gain = audioCtx.createGain();
-      osc.type = 'square';
-      osc.frequency.setValueAtTime(1000, audioCtx.currentTime);
-      gain.gain.setValueAtTime(0.15, audioCtx.currentTime);
-      gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.08);
-      osc.connect(gain);
-      gain.connect(audioCtx.destination);
-      osc.start();
-      osc.stop(audioCtx.currentTime + 0.08);
     } catch (e) {
       // audio unavailable, fail silently
     }
   }
 
-  function autoIncrement() {
-    if (count >= target) {
-      stopPacing();
-      return;
+  function playTickSound() {
+    try {
+      if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      }
+      const fire = function() {
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(1100, audioCtx.currentTime);
+        gain.gain.setValueAtTime(0.0001, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.25, audioCtx.currentTime + 0.005);
+        gain.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + 0.12);
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start();
+        osc.stop(audioCtx.currentTime + 0.13);
+      };
+      if (audioCtx.state === 'suspended') {
+        audioCtx.resume().then(fire).catch(function() { fire(); });
+      } else {
+        fire();
+      }
+    } catch (e) {
+      // audio unavailable, fail silently
     }
+  }
+
+  let nextTickAt = 0;
+  let wakeLock = null;
+
+  function applyOneTick() {
     tapBtn.classList.remove('pulse');
     void tapBtn.offsetWidth;
     tapBtn.classList.add('pulse');
     playTickSound();
     count += 1;
     totalAllTime += 1;
-    render();
-    saveState();
+  }
+
+  function scheduleNextTick() {
+    nextTickAt = Date.now() + pacingSec * 1000;
+  }
+
+  // Runs frequently while Auto is on. Uses real elapsed time (Date.now()) rather
+  // than relying on setInterval firing on schedule, so if the browser throttles
+  // or pauses timers (screen locked, tab backgrounded), the count catches up
+  // correctly the moment the page becomes active again instead of staying stuck.
+  function checkTick() {
+    if (!pacingRunning) return;
+    const now = Date.now();
+    if (now < nextTickAt) return;
+
+    const missedTicks = Math.floor((now - nextTickAt) / (pacingSec * 1000)) + 1;
+    let applied = 0;
+    for (let i = 0; i < missedTicks; i++) {
+      if (count >= target) break;
+      count += 1;
+      totalAllTime += 1;
+      applied++;
+    }
+    nextTickAt += missedTicks * pacingSec * 1000;
+
+    if (applied > 0) {
+      tapBtn.classList.remove('pulse');
+      void tapBtn.offsetWidth;
+      tapBtn.classList.add('pulse');
+      playTickSound();
+      render();
+      saveState();
+    }
+    if (count >= target) {
+      stopPacing();
+    }
+  }
+
+  async function requestWakeLock() {
+    try {
+      if ('wakeLock' in navigator) {
+        wakeLock = await navigator.wakeLock.request('screen');
+        wakeLock.addEventListener('release', function() { wakeLock = null; });
+      }
+    } catch (e) {
+      // Wake Lock unsupported or denied; app still works, screen may just sleep on its own.
+    }
+  }
+
+  function releaseWakeLock() {
+    try {
+      if (wakeLock) {
+        wakeLock.release();
+        wakeLock = null;
+      }
+    } catch (e) {
+      // ignore
+    }
   }
 
   function startPacing() {
     pacingRunning = true;
     pacingToggleBtn.textContent = 'Stop Auto';
     pacingToggleBtn.classList.add('running');
-    autoIncrement();
-    pacingTimerId = setInterval(autoIncrement, pacingSec * 1000);
+    if (count < target) {
+      applyOneTick();
+      render();
+      saveState();
+    }
+    scheduleNextTick();
+    pacingTimerId = setInterval(checkTick, 1000);
+    requestWakeLock();
   }
 
   function stopPacing() {
@@ -543,13 +630,29 @@
       clearInterval(pacingTimerId);
       pacingTimerId = null;
     }
+    releaseWakeLock();
   }
 
   pacingToggleBtn.addEventListener('click', function() {
+    unlockAudioContext();
     if (pacingRunning) {
       stopPacing();
     } else {
       startPacing();
+    }
+  });
+
+  document.addEventListener('visibilitychange', function() {
+    if (document.visibilityState === 'visible') {
+      if (audioCtx && audioCtx.state === 'suspended') {
+        audioCtx.resume().catch(function() {});
+      }
+      if (pacingRunning) {
+        checkTick();
+        if (pacingRunning && !wakeLock) {
+          requestWakeLock();
+        }
+      }
     }
   });
 
