@@ -284,6 +284,58 @@
     border-color: var(--gold);
   }
 
+  .volume-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 0 4px;
+  }
+
+  .volume-icon {
+    font-size: 14px;
+    flex-shrink: 0;
+  }
+
+  .volume-value {
+    font-size: 12px;
+    color: var(--subtext);
+    min-width: 34px;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    flex-shrink: 0;
+  }
+
+  #volumeSlider {
+    flex: 1;
+    -webkit-appearance: none;
+    appearance: none;
+    height: 6px;
+    border-radius: 999px;
+    background: var(--track);
+    outline: none;
+    cursor: pointer;
+  }
+
+  #volumeSlider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    background: var(--accent);
+    cursor: pointer;
+    border: none;
+  }
+
+  #volumeSlider::-moz-range-thumb {
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    background: var(--accent);
+    cursor: pointer;
+    border: none;
+  }
+
   @keyframes pacingPulse {
     0% { box-shadow: 0 10px 24px rgba(47,122,92,0.35), 0 0 0 0 rgba(184,144,47,0.6); }
     70% { box-shadow: 0 10px 24px rgba(47,122,92,0.35), 0 0 0 18px rgba(184,144,47,0); }
@@ -330,6 +382,21 @@
       <button data-sec="10">10s</button>
     </div>
     <button class="pacing-toggle" id="pacingToggleBtn">Start Auto</button>
+
+    <span class="pacing-label" style="margin-top:14px;">Tick sound</span>
+    <div class="pacing-options" id="soundOptions">
+      <button data-sound="soft" class="active">Soft</button>
+      <button data-sound="bell">Bell</button>
+      <button data-sound="click">Click</button>
+    </div>
+
+    <span class="pacing-label" style="margin-top:14px;">Volume</span>
+    <div class="volume-row">
+      <span class="volume-icon">🔈</span>
+      <input type="range" id="volumeSlider" min="0" max="100" value="70" step="1">
+      <span class="volume-icon">🔊</span>
+      <span class="volume-value" id="volumeValue">70%</span>
+    </div>
   </div>
 
   <div class="controls">
@@ -380,11 +447,16 @@
   const sessionsText = document.getElementById('sessionsText');
   const pacingOptions = document.getElementById('pacingOptions');
   const pacingToggleBtn = document.getElementById('pacingToggleBtn');
+  const soundOptions = document.getElementById('soundOptions');
+  const volumeSlider = document.getElementById('volumeSlider');
+  const volumeValue = document.getElementById('volumeValue');
 
   let pacingSec = 5;
   let pacingRunning = false;
   let pacingTimerId = null;
   let audioCtx = null;
+  let soundType = 'soft';
+  let masterVolume = 0.7;
 
   function loadState() {
     try {
@@ -395,6 +467,8 @@
         if (typeof s.target === 'number') target = s.target;
         if (typeof s.totalAllTime === 'number') totalAllTime = s.totalAllTime;
         if (typeof s.phrase === 'string' && PHRASES[s.phrase]) phrase = s.phrase;
+        if (typeof s.soundType === 'string') soundType = s.soundType;
+        if (typeof s.masterVolume === 'number') masterVolume = s.masterVolume;
       }
     } catch (e) {
       // start fresh if storage unavailable
@@ -403,7 +477,7 @@
 
   function saveState() {
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify({ count, target, totalAllTime, phrase }));
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ count, target, totalAllTime, phrase, soundType, masterVolume }));
     } catch (e) {
       // ignore, continue in-memory
     }
@@ -430,6 +504,13 @@
     Array.from(targetButtons.children).forEach(btn => {
       btn.classList.toggle('active', parseInt(btn.dataset.target, 10) === target);
     });
+
+    Array.from(soundOptions.children).forEach(btn => {
+      btn.classList.toggle('active', btn.dataset.sound === soundType);
+    });
+
+    volumeSlider.value = Math.round(masterVolume * 100);
+    volumeValue.textContent = Math.round(masterVolume * 100) + '%';
 
     celebrateText.classList.toggle('show', count >= target && count > 0);
     sessionsText.textContent = totalAllTime > 0 ? ('All-time total: ' + formatNumber(totalAllTime)) : '';
@@ -490,6 +571,27 @@
     }
   });
 
+  volumeSlider.addEventListener('input', function() {
+    masterVolume = parseInt(volumeSlider.value, 10) / 100;
+    volumeValue.textContent = volumeSlider.value + '%';
+    saveState();
+  });
+
+  volumeSlider.addEventListener('change', function() {
+    unlockAudioContext();
+    playTickSound();
+  });
+
+  soundOptions.addEventListener('click', function(e) {
+    const btn = e.target.closest('button[data-sound]');
+    if (!btn) return;
+    soundType = btn.dataset.sound;
+    render();
+    saveState();
+    unlockAudioContext();
+    playTickSound();
+  });
+
   function unlockAudioContext() {
     try {
       if (!audioCtx) {
@@ -516,17 +618,55 @@
         audioCtx = new (window.AudioContext || window.webkitAudioContext)();
       }
       const fire = function() {
-        const osc = audioCtx.createOscillator();
-        const gain = audioCtx.createGain();
-        osc.type = 'sine';
-        osc.frequency.setValueAtTime(1100, audioCtx.currentTime);
-        gain.gain.setValueAtTime(0.0001, audioCtx.currentTime);
-        gain.gain.exponentialRampToValueAtTime(0.25, audioCtx.currentTime + 0.005);
-        gain.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + 0.12);
-        osc.connect(gain);
-        gain.connect(audioCtx.destination);
-        osc.start();
-        osc.stop(audioCtx.currentTime + 0.13);
+        const t0 = audioCtx.currentTime;
+        // Volume grows gradually as progress builds toward the target,
+        // so later ticks feel a little more present than the very first ones.
+        const progress = target > 0 ? Math.min(1, count / target) : 0;
+        const baseVol = 0.16;
+        const maxExtra = 0.22;
+        const peakVol = (baseVol + progress * maxExtra) * masterVolume;
+        if (peakVol <= 0.0001) return;
+
+        if (soundType === 'bell') {
+          // Warm bell-like chime: triangle wave, slower decay.
+          const osc = audioCtx.createOscillator();
+          const gain = audioCtx.createGain();
+          osc.type = 'triangle';
+          osc.frequency.setValueAtTime(880, t0);
+          gain.gain.setValueAtTime(0.0001, t0);
+          gain.gain.exponentialRampToValueAtTime(peakVol, t0 + 0.01);
+          gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.45);
+          osc.connect(gain);
+          gain.connect(audioCtx.destination);
+          osc.start(t0);
+          osc.stop(t0 + 0.46);
+        } else if (soundType === 'click') {
+          // Crisp, very short click: square wave, high pitch, brief.
+          const osc = audioCtx.createOscillator();
+          const gain = audioCtx.createGain();
+          osc.type = 'square';
+          osc.frequency.setValueAtTime(1800, t0);
+          gain.gain.setValueAtTime(0.0001, t0);
+          gain.gain.exponentialRampToValueAtTime(peakVol * 0.9, t0 + 0.003);
+          gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.05);
+          osc.connect(gain);
+          gain.connect(audioCtx.destination);
+          osc.start(t0);
+          osc.stop(t0 + 0.06);
+        } else {
+          // Default "soft" tick: gentle sine, short.
+          const osc = audioCtx.createOscillator();
+          const gain = audioCtx.createGain();
+          osc.type = 'sine';
+          osc.frequency.setValueAtTime(1100, t0);
+          gain.gain.setValueAtTime(0.0001, t0);
+          gain.gain.exponentialRampToValueAtTime(peakVol, t0 + 0.005);
+          gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.12);
+          osc.connect(gain);
+          gain.connect(audioCtx.destination);
+          osc.start(t0);
+          osc.stop(t0 + 0.13);
+        }
       };
       if (audioCtx.state === 'suspended') {
         audioCtx.resume().then(fire).catch(function() { fire(); });
